@@ -28,18 +28,19 @@ export default async function handler(req, res) {
   const headers = { "x-rapidapi-key": apiKey, "x-rapidapi-host": HOST };
 
   try {
-    // 1. Résoudre chaque nom vers son ID numérique + tour (ATP/WTA) via la recherche
-    const [resolvedA, resolvedB] = await Promise.all([
-      searchPlayer(playerA, headers),
-      searchPlayer(playerB, headers),
-    ]);
+    // 1. Résoudre chaque nom vers son ID numérique + tour (ATP/WTA) via la recherche.
+    //    Le plan Basic de RapidAPI limite les requêtes par seconde : on les envoie
+    //    donc l'une après l'autre, avec une petite pause, plutôt qu'en parallèle.
+    const resolvedA = await searchPlayer(playerA, headers);
+    await sleep(700);
+    const resolvedB = await searchPlayer(playerB, headers);
+    await sleep(700);
 
     if (!resolvedA || !resolvedB) {
       // Mode debug : on ramène la réponse brute de la recherche pour comprendre sa vraie structure
-      const [rawA, rawB] = await Promise.all([
-        debugSearch(playerA, headers),
-        debugSearch(playerB, headers),
-      ]);
+      const rawA = await debugSearch(playerA, headers);
+      await sleep(700);
+      const rawB = await debugSearch(playerB, headers);
       return res.status(200).json({
         playerA, playerB, tour: tour.toUpperCase(),
         rankA: null, pointsA: null, rankB: null, pointsB: null,
@@ -61,6 +62,7 @@ export default async function handler(req, res) {
     if (surface) h2hUrl.searchParams.set("surface", surface);
     const h2hRes = await fetch(h2hUrl.toString(), { headers });
     const h2hData = h2hRes.ok ? await h2hRes.json() : { statusCode: h2hRes.status, message: await safeText(h2hRes) };
+    await sleep(700);
 
     // 3. Classement en direct pour situer les deux joueurs
     const rankRes = await fetch(`https://${HOST}/tennis/v2/ms-api/${tourForH2h}/player`, { headers });
@@ -100,6 +102,10 @@ async function safeText(r) {
   try { return await r.text(); } catch { return null; }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Renvoie la réponse brute de /search pour un nom (usage debug uniquement)
 async function debugSearch(name, headers) {
   try {
@@ -126,7 +132,7 @@ async function searchPlayer(fullName, headers) {
   for (const query of candidates) {
     const url = `https://${HOST}/tennis/v2/search?query=${encodeURIComponent(query)}`;
     const r = await fetch(url, { headers });
-    if (!r.ok) continue;
+    if (!r.ok) { await sleep(700); continue; }
     const data = await r.json();
     const buckets = (data && (data.data || data)) || [];
     const bucketList = Array.isArray(buckets) ? buckets : Object.values(buckets);
@@ -143,6 +149,7 @@ async function searchPlayer(fullName, headers) {
         return { id: pick.id, name: pick.name || fullName, tour: category === "player_atp" ? "atp" : "wta" };
       }
     }
+    if (query !== candidates[candidates.length - 1]) await sleep(700);
   }
   return null;
 }
