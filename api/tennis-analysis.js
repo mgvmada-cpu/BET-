@@ -1,10 +1,16 @@
 // api/tennis-analysis.js — Fonction serverless Vercel (Node.js)
 //
 // Récupère, pour deux joueurs nommés, les statistiques réelles service/retour
-// issues de leur historique de confrontations (H2H) ou de leurs fiches individuelles,
-// ainsi que le classement ATP/WTA en direct, et les renvoie normalisées pour QuantCourt.
+// issues de leur historique de confrontations (H2H), le classement ATP/WTA en
+// direct, et les renvoie normalisées pour QuantCourt.
 //
 // Source : "Tennis API - ATP WTA ITF" sur RapidAPI (tennis-api-atp-wta-itf.p.rapidapi.com)
+//
+// IMPORTANT : les endpoints H2H de cette API attendent des IDENTIFIANTS NUMÉRIQUES,
+// pas des noms en texte libre. On fait donc d'abord une recherche par nom pour
+// résoudre chaque joueur vers son ID, puis on appelle le H2H avec ces IDs.
+//
+// SÉCURITÉ : la clé n'est jamais exposée au navigateur, elle reste côté serveur.
 
 const HOST = "tennis-api-atp-wta-itf.p.rapidapi.com";
 
@@ -29,6 +35,7 @@ export default async function handler(req, res) {
     ]);
 
     if (!resolvedA || !resolvedB) {
+      // Mode debug : on ramène la réponse brute de la recherche pour comprendre sa vraie structure
       const [rawA, rawB] = await Promise.all([
         debugSearch(playerA, headers),
         debugSearch(playerB, headers),
@@ -47,56 +54,33 @@ export default async function handler(req, res) {
       });
     }
 
-    const tourForH2h = resolvedA.tour || tour.toLowerCase();
+    const tourForH2h = resolvedA.tour; // les deux joueurs sont normalement sur le même circuit
 
-    // 2. Récupération des statistiques (H2H prioritaire, sinon Stats individuelles)
-    let serveA = null, serveB = null, returnA = null, returnB = null;
-    let h2hRaw = null;
+    // 2. Stats H2H (service/retour, points de break, etc.) avec les vrais IDs
+    const h2hUrl = new URL(`https://${HOST}/tennis/v2/h2h/stats/${tourForH2h}/${resolvedA.id}/${resolvedB.id}`);
+    if (surface) h2hUrl.searchParams.set("surface", surface);
+    const h2hRes = await fetch(h2hUrl.toString(), { headers });
+    const h2hData = h2hRes.ok ? await h2hRes.json() : { statusCode: h2hRes.status, message: await safeText(h2hRes) };
 
-    try {
-      const h2hUrl = new URL(`https://${HOST}/tennis/v2/h2h/stats/${tourForH2h}/${resolvedA.id}/${resolvedB.id}`);
-      if (surface) h2hUrl.searchParams.set("surface", surface);
-      const h2hRes = await fetch(h2hUrl.toString(), { headers });
-      
-      if (h2hRes.ok) {
-        h2hRaw = await h2hRes.json();
-        const raw = (h2hRaw && h2hRaw.data) || h2hRaw || {};
-        const p1 = findObj(raw, "player1") || findObj(raw, "playerstats") || raw;
-        const p2 = findObj(raw, "player2") || findObj(raw, "opponentstats") || raw;
-
-        serveA = findStat(p1, ["servewon", "servicewon", "firstservewon"]);
-        serveB = findStat(p2, ["servewon", "servicewon", "firstservewon"]);
-        returnA = findStat(p1, ["returnwon", "returnpointswon"]);
-        returnB = findStat(p2, ["returnwon", "returnpointswon"]);
-      }
-    } catch (e) {
-      console.warn("Échec H2H, passage au fallback individuel", e);
-    }
-
-    // Fallback : Si les stats H2H sont incomplètes, charger les profils individuels
-    if (serveA === null || returnA === null) {
-      const statsA = await fetchPlayerStats(resolvedA.id, tourForH2h, headers);
-      if (serveA === null) serveA = statsA.serve;
-      if (returnA === null) returnA = statsA.return;
-    }
-    if (serveB === null || returnB === null) {
-      const statsB = await fetchPlayerStats(resolvedB.id, tourForH2h, headers);
-      if (serveB === null) serveB = statsB.serve;
-      if (returnB === null) returnB = statsB.return;
-    }
-
-    // 3. Classement en direct
+    // 3. Classement en direct pour situer les deux joueurs
     const rankRes = await fetch(`https://${HOST}/tennis/v2/ms-api/${tourForH2h}/player`, { headers });
     const rankData = rankRes.ok ? await rankRes.json() : null;
     const players = (rankData && (rankData.data || rankData.players || rankData)) || [];
     const rankA = findPlayerInList(players, resolvedA.id, resolvedA.name);
     const rankB = findPlayerInList(players, resolvedB.id, resolvedB.name);
 
+    // 4. Extraction souple des % service/retour depuis la réponse H2H
+    const raw = (h2hData && h2hData.data) || h2hData || {};
+    const p1 = findObj(raw, "player1") || findObj(raw, "playerstats") || raw;
+    const p2 = findObj(raw, "player2") || findObj(raw, "opponentstats") || raw;
+    const serveA = findStat(p1, ["servewon", "servicewon", "firstservewon"]);
+    const serveB = findStat(p2, ["servewon", "servicewon", "firstservewon"]);
+    const returnA = findStat(p1, ["returnwon", "returnpointswon"]);
+    const returnB = findStat(p2, ["returnwon", "returnpointswon"]);
+
     res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
     res.status(200).json({
-      playerA: resolvedA.name, 
-      playerB: resolvedB.name, 
-      tour: tourForH2h.toUpperCase(),
+      playerA: resolvedA.name, playerB: resolvedB.name, tour: tourForH2h.toUpperCase(),
       rankA: rankA ? rankA.rank : null,
       pointsA: rankA ? rankA.points : null,
       rankB: rankB ? rankB.rank : null,
@@ -105,82 +89,18 @@ export default async function handler(req, res) {
       serveB: normalizePct(serveB),
       returnA: normalizePct(returnA),
       returnB: normalizePct(returnB),
-      h2hRaw: h2hRaw,
+      h2hRaw: raw, // données brutes, au cas où l'extraction automatique manque un champ
     });
   } catch (err) {
     res.status(502).json({ error: "Échec de récupération des données joueurs", detail: String(err.message || err) });
   }
 }
 
-// Fonction de recherche de joueur tolérante et robuste
-async function searchPlayer(name, headers) {
-  const url = `https://${HOST}/tennis/v2/search?query=${encodeURIComponent(name)}`;
-  const r = await fetch(url, { headers });
-  if (!r.ok) return null;
-
-  const data = await r.json();
-  const buckets = (data && (data.data || data)) || [];
-  const bucketList = Array.isArray(buckets) ? buckets : Object.values(buckets);
-
-  const unwrap = (item) => (item ? (item.entity || item.player || item.item || item) : null);
-
-  for (const bucket of bucketList) {
-    const category = (bucket && bucket.category) || "";
-    if (category !== "player_atp" && category !== "player_wta") continue;
-
-    const rawResults = bucket.results || bucket.items || bucket.players || bucket.data || [];
-    if (!Array.isArray(rawResults) || rawResults.length === 0) continue;
-
-    const results = rawResults.map(unwrap).filter(Boolean);
-    const lower = name.toLowerCase().trim();
-
-    // 1. Recherche par correspondance exacte
-    let pick = results.find((p) => {
-      const pName = (p.name || p.fullName || "").toLowerCase();
-      return pName === lower;
-    });
-
-    // 2. Recherche par sous-chaîne ou mots clés (ex: prénom + nom inversés)
-    if (!pick) {
-      const parts = lower.split(" ");
-      pick = results.find((p) => {
-        const pName = (p.name || p.fullName || "").toLowerCase();
-        return parts.every((part) => pName.includes(part));
-      });
-    }
-
-    // 3. Premier résultat par défaut du bucket ATP/WTA
-    if (!pick) pick = results[0];
-
-    if (pick && (pick.id != null || pick.playerId != null)) {
-      return {
-        id: pick.id ?? pick.playerId,
-        name: pick.name || pick.fullName || name,
-        tour: category === "player_atp" ? "atp" : "wta",
-      };
-    }
-  }
-  return null;
+async function safeText(r) {
+  try { return await r.text(); } catch { return null; }
 }
 
-// Récupération des statistiques individuelles d'un joueur en cas de H2H vide
-async function fetchPlayerStats(playerId, tour, headers) {
-  try {
-    const url = `https://${HOST}/tennis/v2/player/${tour}/${playerId}/stats`;
-    const r = await fetch(url, { headers });
-    if (!r.ok) return { serve: null, return: null };
-    const data = await r.json();
-    const raw = (data && data.data) || data || {};
-
-    return {
-      serve: findStat(raw, ["servewon", "servicewon", "firstservewon"]),
-      return: findStat(raw, ["returnwon", "returnpointswon"]),
-    };
-  } catch {
-    return { serve: null, return: null };
-  }
-}
-
+// Renvoie la réponse brute de /search pour un nom (usage debug uniquement)
 async function debugSearch(name, headers) {
   try {
     const url = `https://${HOST}/tennis/v2/search?query=${encodeURIComponent(name)}`;
@@ -194,15 +114,48 @@ async function debugSearch(name, headers) {
   }
 }
 
+// Cherche un joueur par nom via l'endpoint de recherche global (ATP + WTA).
+// On cherche par NOM DE FAMILLE uniquement : la base stocke parfois les noms
+// dans un ordre différent (ex. "Alcaraz Carlos"), donc une recherche sur le nom
+// complet "Carlos Alcaraz" peut ne rien trouver alors que "Alcaraz" seul marche.
+async function searchPlayer(fullName, headers) {
+  const parts = fullName.trim().split(/\s+/);
+  const lastName = parts[parts.length - 1];
+  const candidates = [lastName, fullName]; // on essaie le nom de famille d'abord
+
+  for (const query of candidates) {
+    const url = `https://${HOST}/tennis/v2/search?query=${encodeURIComponent(query)}`;
+    const r = await fetch(url, { headers });
+    if (!r.ok) continue;
+    const data = await r.json();
+    const buckets = (data && (data.data || data)) || [];
+    const bucketList = Array.isArray(buckets) ? buckets : Object.values(buckets);
+
+    for (const bucket of bucketList) {
+      const category = (bucket && bucket.category) || "";
+      if (category !== "player_atp" && category !== "player_wta") continue;
+      const results = bucket.result || bucket.results || bucket.items || bucket.players || bucket.data || [];
+      if (!Array.isArray(results) || results.length === 0) continue;
+      const lowerFull = fullName.toLowerCase();
+      const exact = results.find((p) => (p.name || "").toLowerCase() === lowerFull);
+      const pick = exact || results[0];
+      if (pick && pick.id != null) {
+        return { id: pick.id, name: pick.name || fullName, tour: category === "player_atp" ? "atp" : "wta" };
+      }
+    }
+  }
+  return null;
+}
+
+// Trouve un joueur dans la liste de classement par ID (prioritaire) ou par nom
 function findPlayerInList(players, id, name) {
   if (!Array.isArray(players)) return null;
   const byId = players.find((p) => p.id === id || p.playerId === id);
   if (byId) return normalizeRankEntry(byId);
   const lower = (name || "").toLowerCase();
-  const byName = players.find((p) => (p.name || p.fullName || "").toLowerCase().includes(lower));
+  const byName = players.find((p) => (p.name || "").toLowerCase() === lower);
   return byName ? normalizeRankEntry(byName) : null;
 }
-
 function normalizeRankEntry(p) {
   return {
     rank: p.rank ?? p.ranking ?? p.currentRank ?? null,
@@ -210,6 +163,7 @@ function normalizeRankEntry(p) {
   };
 }
 
+// Trouve le premier sous-objet dont la clé contient `tag` (insensible à la casse)
 function findObj(obj, tag) {
   if (!obj || typeof obj !== "object") return null;
   for (const [k, v] of Object.entries(obj)) {
@@ -218,6 +172,8 @@ function findObj(obj, tag) {
   return null;
 }
 
+// Recherche récursive (profondeur limitée) d'une valeur numérique dont le nom de
+// la clé contient l'un des motifs demandés (insensible à la casse).
 function findStat(obj, patterns, depth = 0) {
   if (!obj || typeof obj !== "object" || depth > 4) return null;
   for (const [k, v] of Object.entries(obj)) {
@@ -233,8 +189,9 @@ function findStat(obj, patterns, depth = 0) {
   return null;
 }
 
+// Ramène une valeur (déjà en % ex. 64, ou en fraction ex. 0.64) sur une échelle 0-100
 function normalizePct(v) {
   if (v === null || v === undefined || isNaN(v)) return null;
   const n = v <= 1 ? v * 100 : v;
   return Math.round(Math.max(1, Math.min(99, n)));
-      }
+}
